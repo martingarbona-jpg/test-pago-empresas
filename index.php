@@ -1,5 +1,6 @@
 <?php
 session_start();
+require_once __DIR__ . "/db.php";
 
 $USUARIOS = [
     "ADMIN" => "Uma334484",
@@ -16,26 +17,243 @@ $pagosFile = $dataDir . "/pagos.json";
 $auditoriaFile = $dataDir . "/auditoria.json";
 $papeleraPagosFile = $dataDir . "/papelera_pagos.json";
 
-if (!is_dir($dataDir)) mkdir($dataDir, 0755, true);
 if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
-if (!file_exists($empresasFile)) file_put_contents($empresasFile, "[]");
-if (!file_exists($pagosFile)) file_put_contents($pagosFile, "[]");
-if (!file_exists($auditoriaFile)) file_put_contents($auditoriaFile, "[]");
-if (!file_exists($papeleraPagosFile)) file_put_contents($papeleraPagosFile, "[]");
 
 function e($v) {
     return htmlspecialchars($v ?? "", ENT_QUOTES, "UTF-8");
 }
 
-function leerJson($file) {
-    $json = file_get_contents($file);
-    $data = json_decode($json, true);
-    return is_array($data) ? $data : [];
+function pdoSistema() {
+    global $pdo;
+    if (!isset($pdo) || !($pdo instanceof PDO)) {
+        die("No se pudo conectar a la base de datos.");
+    }
+    return $pdo;
 }
 
-function guardarJson($file, $data) {
-    file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+function columnasTabla($tabla) {
+    static $cache = [];
+    $tablasPermitidas = ["empresas", "pagos", "auditoria", "papelera_pagos"];
+    if (!in_array($tabla, $tablasPermitidas, true)) {
+        throw new RuntimeException("Tabla no permitida.");
+    }
+    if (!isset($cache[$tabla])) {
+        $stmt = pdoSistema()->query("SHOW COLUMNS FROM `$tabla`");
+        $cache[$tabla] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+    return $cache[$tabla];
 }
+
+function nombresColumnasTabla($tabla) {
+    return array_map(fn($columna) => $columna["Field"], columnasTabla($tabla));
+}
+
+function columnaTabla($tabla, $nombre) {
+    foreach (columnasTabla($tabla) as $columna) {
+        if (($columna["Field"] ?? "") === $nombre) return $columna;
+    }
+    return null;
+}
+
+function columnaAutoIncremental($columna) {
+    return isset($columna["Extra"]) && stripos($columna["Extra"], "auto_increment") !== false;
+}
+
+function columnaNumerica($columna) {
+    return isset($columna["Type"]) && preg_match('/\b(int|decimal|float|double|real|numeric)\b/i', $columna["Type"]);
+}
+
+function columnaTexto($columna) {
+    return isset($columna["Type"]) && preg_match('/\b(char|text|json)\b/i', $columna["Type"]);
+}
+
+function decodificarValorBD($valor) {
+    if (!is_string($valor)) return $valor;
+    $trim = trim($valor);
+    if ($trim === "") return $valor;
+    if ($trim[0] !== "{" && $trim[0] !== "[") return $valor;
+    $decodificado = json_decode($trim, true);
+    return json_last_error() === JSON_ERROR_NONE ? $decodificado : $valor;
+}
+
+function normalizarRegistroDesdeBD($tabla, $fila) {
+    $registro = [];
+    $columnaJson = null;
+    foreach (["data", "datos", "json", "payload"] as $posible) {
+        if (array_key_exists($posible, $fila)) {
+            $columnaJson = $posible;
+            break;
+        }
+    }
+
+    if ($columnaJson !== null) {
+        $datos = decodificarValorBD($fila[$columnaJson]);
+        if (is_array($datos)) $registro = $datos;
+    }
+
+    foreach ($fila as $campo => $valor) {
+        if ($campo === $columnaJson) continue;
+        $columna = columnaTabla($tabla, $campo);
+        if ($campo === "id" && columnaNumerica($columna) && !columnaTexto($columna)) continue;
+        $registro[$campo] = decodificarValorBD($valor);
+    }
+
+    if (!isset($registro["id"])) {
+        foreach (["pago_id", "empresa_id_original", "registro_id"] as $campoId) {
+            if (isset($fila[$campoId]) && trim((string)$fila[$campoId]) !== "") {
+                $registro["id"] = $fila[$campoId];
+                break;
+            }
+        }
+    }
+
+    if (array_key_exists("activa", $registro) && ($registro["activa"] === null || $registro["activa"] === "")) {
+        unset($registro["activa"]);
+    } elseif (array_key_exists("activa", $registro)) {
+        $registro["activa"] = filter_var($registro["activa"], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        if ($registro["activa"] === null) $registro["activa"] = false;
+    }
+
+    return $registro;
+}
+
+function columnaOrdenTabla($tabla) {
+    $columnas = nombresColumnasTabla($tabla);
+    foreach (["fecha_carga", "fecha", "created_at", "id"] as $columna) {
+        if (in_array($columna, $columnas, true)) return $columna;
+    }
+    return null;
+}
+
+function obtenerRegistros($tabla) {
+    $orden = columnaOrdenTabla($tabla);
+    $sql = "SELECT * FROM `$tabla`" . ($orden ? " ORDER BY `$orden` ASC" : "");
+    $stmt = pdoSistema()->query($sql);
+    return array_map(fn($fila) => normalizarRegistroDesdeBD($tabla, $fila), $stmt->fetchAll(PDO::FETCH_ASSOC));
+}
+
+function valorParaBD($valor) {
+    if (is_array($valor) || is_object($valor)) {
+        return json_encode($valor, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+    if (is_bool($valor)) return $valor ? 1 : 0;
+    return $valor;
+}
+
+function datosInsertables($tabla, $registro) {
+    $columnas = columnasTabla($tabla);
+    $nombres = array_column($columnas, "Field");
+    $datos = [];
+    $columnaJson = null;
+    foreach (["data", "datos", "json", "payload"] as $posible) {
+        if (in_array($posible, $nombres, true)) {
+            $columnaJson = $posible;
+            break;
+        }
+    }
+
+    if ($columnaJson !== null) {
+        $datos[$columnaJson] = json_encode($registro, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+
+    foreach ($columnas as $columna) {
+        $campo = $columna["Field"];
+        if ($campo === $columnaJson) continue;
+        if (array_key_exists($campo, $registro)) {
+            if ($campo === "id" && columnaNumerica($columna) && !is_numeric($registro[$campo])) continue;
+            $datos[$campo] = valorParaBD($registro[$campo]);
+        }
+    }
+
+    if (isset($registro["id"]) && !isset($datos["id"]) && in_array("pago_id", $nombres, true)) {
+        $datos["pago_id"] = $registro["id"];
+    }
+
+    foreach ($columnas as $columna) {
+        $campo = $columna["Field"];
+        if (isset($datos[$campo]) || columnaAutoIncremental($columna)) continue;
+        if (($columna["Null"] ?? "") === "NO" && ($columna["Default"] ?? null) === null) {
+            if (columnaNumerica($columna)) {
+                $datos[$campo] = 0;
+            } elseif (preg_match('/\b(date|datetime|timestamp)\b/i', $columna["Type"] ?? "")) {
+                $tipoColumna = strtolower($columna["Type"] ?? "");
+                $datos[$campo] = preg_match('/^date\b/', $tipoColumna) ? date("Y-m-d") : date("Y-m-d H:i:s");
+            } elseif (stripos($columna["Type"] ?? "", "json") !== false) {
+                $datos[$campo] = "[]";
+            } else {
+                $datos[$campo] = "";
+            }
+        }
+    }
+
+    return $datos;
+}
+
+function guardarRegistros($tabla, $registros) {
+    $pdo = pdoSistema();
+    $registros = is_array($registros) ? array_values($registros) : [];
+    $columnaId = columnaTabla($tabla, "id");
+    $usaIdTexto = $columnaId && !columnaAutoIncremental($columnaId) && (!columnaNumerica($columnaId) || columnaTexto($columnaId));
+    $todosConId = $usaIdTexto && count(array_filter($registros, fn($registro) => trim((string)($registro["id"] ?? "")) !== "")) === count($registros);
+
+    $pdo->beginTransaction();
+    try {
+        if (!$todosConId) {
+            $pdo->exec("DELETE FROM `$tabla`");
+        }
+
+        $idsActuales = [];
+        foreach ($registros as $registro) {
+            $datos = datosInsertables($tabla, $registro);
+            if (!$datos) continue;
+
+            $campos = array_keys($datos);
+            $columnasSql = implode(", ", array_map(fn($campo) => "`$campo`", $campos));
+            $marcasSql = implode(", ", array_map(fn($campo) => ":$campo", $campos));
+            $params = [];
+            foreach ($datos as $campo => $valor) {
+                $params[":$campo"] = $valor;
+            }
+
+            if ($todosConId) {
+                $actualizaciones = array_values(array_filter($campos, fn($campo) => $campo !== "id"));
+                $updateSql = $actualizaciones
+                    ? " ON DUPLICATE KEY UPDATE " . implode(", ", array_map(fn($campo) => "`$campo` = VALUES(`$campo`)", $actualizaciones))
+                    : "";
+                $idsActuales[] = (string)$registro["id"];
+            } else {
+                $updateSql = "";
+            }
+
+            $stmt = $pdo->prepare("INSERT INTO `$tabla` ($columnasSql) VALUES ($marcasSql)$updateSql");
+            $stmt->execute($params);
+        }
+
+        if ($todosConId) {
+            if ($idsActuales) {
+                $marcas = implode(", ", array_fill(0, count($idsActuales), "?"));
+                $stmt = $pdo->prepare("DELETE FROM `$tabla` WHERE `id` NOT IN ($marcas)");
+                $stmt->execute($idsActuales);
+            } else {
+                $pdo->exec("DELETE FROM `$tabla`");
+            }
+        }
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+}
+
+function obtenerEmpresas() { return obtenerRegistros("empresas"); }
+function guardarEmpresas($empresas) { guardarRegistros("empresas", $empresas); }
+function obtenerPagos() { return obtenerRegistros("pagos"); }
+function guardarPagos($pagos) { guardarRegistros("pagos", $pagos); }
+function obtenerAuditoria() { return obtenerRegistros("auditoria"); }
+function guardarAuditoria($auditoria) { guardarRegistros("auditoria", $auditoria); }
+function obtenerPapeleraPagos() { return obtenerRegistros("papelera_pagos"); }
+function guardarPapeleraPagos($papeleraPagos) { guardarRegistros("papelera_pagos", $papeleraPagos); }
 
 function usuarioActual() {
     return $_SESSION["usuario"] ?? $_SESSION["usuario_logueado"] ?? "";
@@ -62,14 +280,14 @@ function empresaActiva($empresa) {
 }
 
 function registrarAuditoria($auditoriaFile, $accion, $detalle) {
-    $auditoria = leerJson($auditoriaFile);
+    $auditoria = obtenerAuditoria();
     $auditoria[] = [
         "fecha" => date("Y-m-d H:i:s"),
         "usuario" => usuarioActual() ?: "SISTEMA",
         "accion" => $accion,
         "detalle" => $detalle
     ];
-    guardarJson($auditoriaFile, $auditoria);
+    guardarAuditoria($auditoria);
 }
 
 function detalleEmpresa($empresa) {
@@ -385,15 +603,34 @@ function enviarBackupManual($empresasFile, $pagosFile, $auditoriaFile, $papelera
     }
 
     $ok = true;
-    $ok = $ok && is_file($empresasFile) && $zip->addFile($empresasFile, "empresas.json");
-    $ok = $ok && is_file($pagosFile) && $zip->addFile($pagosFile, "pagos.json");
-    $ok = $ok && is_file($auditoriaFile) && $zip->addFile($auditoriaFile, "auditoria.json");
-    $ok = $ok && is_file($papeleraPagosFile) && $zip->addFile($papeleraPagosFile, "papelera_pagos.json");
+    $jsonTemporales = [];
+    $datosBackup = [
+        "empresas.json" => obtenerEmpresas(),
+        "pagos.json" => obtenerPagos(),
+        "auditoria.json" => obtenerAuditoria(),
+        "papelera_pagos.json" => obtenerPapeleraPagos()
+    ];
+    foreach ($datosBackup as $nombreJson => $datosJson) {
+        $archivoJson = tempnam(sys_get_temp_dir(), "backup_json_");
+        if ($archivoJson === false) {
+            $ok = false;
+            break;
+        }
+        $jsonTemporales[] = $archivoJson;
+        $ok = $ok && file_put_contents($archivoJson, json_encode($datosJson, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX) !== false;
+        $ok = $ok && $zip->addFile($archivoJson, $nombreJson);
+    }
     $ok = $ok && agregarDirectorioZip($zip, $uploadDir, "comprobantes");
 
     if (!$zip->close() || !$ok) {
+        foreach ($jsonTemporales as $archivoJson) {
+            @unlink($archivoJson);
+        }
         @unlink($zipTemporal);
         return false;
+    }
+    foreach ($jsonTemporales as $archivoJson) {
+        @unlink($archivoJson);
     }
 
     if (!is_file($zipTemporal)) {
@@ -582,10 +819,10 @@ if (isset($_GET["backup"])) {
     }
 }
 
-$empresas = leerJson($empresasFile);
-$pagos = leerJson($pagosFile);
-$auditoria = leerJson($auditoriaFile);
-$papeleraPagos = leerJson($papeleraPagosFile);
+$empresas = obtenerEmpresas();
+$pagos = obtenerPagos();
+$auditoria = obtenerAuditoria();
+$papeleraPagos = obtenerPapeleraPagos();
 $errorEmpresa = "";
 $coincidenciasEmpresa = ["cuit" => null, "exacta" => null, "parecidas" => []];
 $advertenciaEmpresa = false;
@@ -748,7 +985,7 @@ if (isset($_POST["guardar_empresa"])) {
 
         if (!$editado) $empresas[] = $nueva;
 
-        guardarJson($empresasFile, $empresas);
+        guardarEmpresas($empresas);
         registrarAuditoria(
             $auditoriaFile,
             $editado ? "editar_empresa" : "crear_empresa",
@@ -833,7 +1070,7 @@ if (isset($_POST["guardar_acuerdo"])) {
             }
         }
 
-        guardarJson($empresasFile, $empresas);
+        guardarEmpresas($empresas);
         registrarAuditoria(
             $auditoriaFile,
             $acuerdoEditado ? "editar_acuerdo" : "crear_acuerdo",
@@ -970,7 +1207,7 @@ if (isset($_POST["guardar_pago"])) {
 
         if (!$editado) $pagos[] = $nuevo;
 
-        guardarJson($pagosFile, $pagos);
+        guardarPagos($pagos);
         registrarAuditoria(
             $auditoriaFile,
             $editado ? "editar_pago" : "crear_pago",
@@ -1011,7 +1248,7 @@ if (isset($_POST["marcar_cheque_cobrado"])) {
             $pagos[$pagoIndice]["cheques"][$indiceCheque]["usuario_cobrado"] = usuarioActual();
             $empresaCheque = buscarEmpresa($empresas, $pago["empresa_id"] ?? "");
             $fechaChequeAuditada = $pagos[$pagoIndice]["cheques"][$indiceCheque]["fecha_cobro"] ?? "";
-            guardarJson($pagosFile, $pagos);
+            guardarPagos($pagos);
             registrarAuditoria(
                 $auditoriaFile,
                 "marcar_cheque_cobrado",
@@ -1041,7 +1278,7 @@ if (isset($_GET["eliminar_empresa"])) {
             break;
         }
     }
-    guardarJson($empresasFile, $empresas);
+    guardarEmpresas($empresas);
     if ($empresaBaja) {
         registrarAuditoria($auditoriaFile, "dar_de_baja_empresa", "Dio de baja empresa " . detalleEmpresa($empresaBaja));
     }
@@ -1064,8 +1301,8 @@ if (isset($_GET["eliminar_pago"])) {
         $pagoEliminado["motivo"] = trim($_GET["motivo"] ?? "");
         $papeleraPagos[] = $pagoEliminado;
         $pagos = array_values(array_filter($pagos, fn($p) => ($p["id"] ?? "") !== $id));
-        guardarJson($pagosFile, $pagos);
-        guardarJson($papeleraPagosFile, $papeleraPagos);
+        guardarPagos($pagos);
+        guardarPapeleraPagos($papeleraPagos);
         registrarAuditoria($auditoriaFile, "eliminar_pago", "Eliminó pago de " . detallePago($pagoEliminado, $empresas));
     }
     header("Location: index.php");
@@ -1085,7 +1322,7 @@ if (isset($_GET["eliminar_acuerdo"], $_GET["tipo_acuerdo"])) {
             registrarAuditoria($auditoriaFile, "eliminar_acuerdo", "Eliminó acuerdo de " . (($empresas[$k]["razon"] ?? "Empresa") . " - " . $tipoAcuerdoEliminar));
             break;
         }
-        guardarJson($empresasFile, $empresas);
+        guardarEmpresas($empresas);
     }
 
     $destino = ($_GET["origen"] ?? "") === "ficha" ? "buscar-empresa" : "cargar-acuerdo";
@@ -1108,7 +1345,7 @@ if (isset($_GET["eliminar_comprobante"])) {
         }
     }
 
-    guardarJson($pagosFile, $pagos);
+    guardarPagos($pagos);
     header("Location: index.php?editar_pago=" . urlencode($id));
     exit;
 }
