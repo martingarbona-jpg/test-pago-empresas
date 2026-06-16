@@ -78,6 +78,9 @@ function decodificarValorBD($valor) {
 
 function normalizarRegistroDesdeBD($tabla, $fila) {
     $registro = [];
+    if (isset($fila["json_id"]) && trim((string)$fila["json_id"]) !== "") {
+        $registro["id"] = $fila["json_id"];
+    }
     $columnaJson = null;
     foreach (["data", "datos", "json", "payload"] as $posible) {
         if (array_key_exists($posible, $fila)) {
@@ -93,6 +96,11 @@ function normalizarRegistroDesdeBD($tabla, $fila) {
 
     foreach ($fila as $campo => $valor) {
         if ($campo === $columnaJson) continue;
+        if ($campo === "json_id") continue;
+        if ($campo === "empresa_json_id") {
+            $registro["empresa_id"] = decodificarValorBD($valor);
+            continue;
+        }
         $columna = columnaTabla($tabla, $campo);
         if ($campo === "id" && columnaNumerica($columna) && !columnaTexto($columna)) continue;
         $registro[$campo] = decodificarValorBD($valor);
@@ -159,6 +167,14 @@ function datosInsertables($tabla, $registro) {
     foreach ($columnas as $columna) {
         $campo = $columna["Field"];
         if ($campo === $columnaJson) continue;
+        if ($campo === "json_id" && isset($registro["id"])) {
+            $datos[$campo] = $registro["id"];
+            continue;
+        }
+        if ($campo === "empresa_json_id" && isset($registro["empresa_id"])) {
+            $datos[$campo] = $registro["empresa_id"];
+            continue;
+        }
         if (array_key_exists($campo, $registro)) {
             if ($campo === "id" && columnaNumerica($columna) && !is_numeric($registro[$campo])) continue;
             $datos[$campo] = valorParaBD($registro[$campo]);
@@ -189,51 +205,92 @@ function datosInsertables($tabla, $registro) {
     return $datos;
 }
 
+function columnaClaveLogica($tabla) {
+    $nombres = nombresColumnasTabla($tabla);
+    if (in_array("json_id", $nombres, true)) return "json_id";
+
+    $columnaId = columnaTabla($tabla, "id");
+    if ($columnaId && !columnaAutoIncremental($columnaId) && (!columnaNumerica($columnaId) || columnaTexto($columnaId))) {
+        return "id";
+    }
+
+    foreach (["pago_id", "empresa_id_original", "registro_id"] as $campo) {
+        if (in_array($campo, $nombres, true)) return $campo;
+    }
+
+    return null;
+}
+
 function guardarRegistros($tabla, $registros) {
     $pdo = pdoSistema();
     $registros = is_array($registros) ? array_values($registros) : [];
-    $columnaId = columnaTabla($tabla, "id");
-    $usaIdTexto = $columnaId && !columnaAutoIncremental($columnaId) && (!columnaNumerica($columnaId) || columnaTexto($columnaId));
-    $todosConId = $usaIdTexto && count(array_filter($registros, fn($registro) => trim((string)($registro["id"] ?? "")) !== "")) === count($registros);
+    $columnaClave = columnaClaveLogica($tabla);
+    $todosConClave = $columnaClave && count(array_filter($registros, fn($registro) => trim((string)($registro["id"] ?? "")) !== "")) === count($registros);
 
     $pdo->beginTransaction();
     try {
-        if (!$todosConId) {
+        if (!$todosConClave) {
             $pdo->exec("DELETE FROM `$tabla`");
         }
 
-        $idsActuales = [];
+        $clavesActuales = [];
         foreach ($registros as $registro) {
             $datos = datosInsertables($tabla, $registro);
             if (!$datos) continue;
 
             $campos = array_keys($datos);
+            $params = [];
+            foreach ($datos as $campo => $valor) {
+                $params[":$campo"] = $valor;
+            }
+
+            if ($todosConClave) {
+                $clave = (string)$registro["id"];
+                $clavesActuales[] = $clave;
+                $datos[$columnaClave] = $clave;
+                $campos = array_keys($datos);
+                $existeStmt = $pdo->prepare("SELECT COUNT(*) FROM `$tabla` WHERE `$columnaClave` = ?");
+                $existeStmt->execute([$clave]);
+                $existe = intval($existeStmt->fetchColumn()) > 0;
+
+                if ($existe) {
+                    $actualizaciones = array_values(array_filter($campos, fn($campo) => $campo !== $columnaClave && !columnaAutoIncremental(columnaTabla($tabla, $campo))));
+                    if ($actualizaciones) {
+                        $setSql = implode(", ", array_map(fn($campo) => "`$campo` = :$campo", $actualizaciones));
+                        $updateParams = [];
+                        foreach ($actualizaciones as $campo) {
+                            $updateParams[":$campo"] = $datos[$campo];
+                        }
+                        $updateParams[":clave_logica"] = $clave;
+                        $stmt = $pdo->prepare("UPDATE `$tabla` SET $setSql WHERE `$columnaClave` = :clave_logica");
+                        $stmt->execute($updateParams);
+                    }
+                    continue;
+                }
+            } else {
+                $datos = array_filter(
+                    $datos,
+                    fn($valor, $campo) => !columnaAutoIncremental(columnaTabla($tabla, $campo)),
+                    ARRAY_FILTER_USE_BOTH
+                );
+                $campos = array_keys($datos);
+            }
+
             $columnasSql = implode(", ", array_map(fn($campo) => "`$campo`", $campos));
             $marcasSql = implode(", ", array_map(fn($campo) => ":$campo", $campos));
             $params = [];
             foreach ($datos as $campo => $valor) {
                 $params[":$campo"] = $valor;
             }
-
-            if ($todosConId) {
-                $actualizaciones = array_values(array_filter($campos, fn($campo) => $campo !== "id"));
-                $updateSql = $actualizaciones
-                    ? " ON DUPLICATE KEY UPDATE " . implode(", ", array_map(fn($campo) => "`$campo` = VALUES(`$campo`)", $actualizaciones))
-                    : "";
-                $idsActuales[] = (string)$registro["id"];
-            } else {
-                $updateSql = "";
-            }
-
-            $stmt = $pdo->prepare("INSERT INTO `$tabla` ($columnasSql) VALUES ($marcasSql)$updateSql");
+            $stmt = $pdo->prepare("INSERT INTO `$tabla` ($columnasSql) VALUES ($marcasSql)");
             $stmt->execute($params);
         }
 
-        if ($todosConId) {
-            if ($idsActuales) {
-                $marcas = implode(", ", array_fill(0, count($idsActuales), "?"));
-                $stmt = $pdo->prepare("DELETE FROM `$tabla` WHERE `id` NOT IN ($marcas)");
-                $stmt->execute($idsActuales);
+        if ($todosConClave) {
+            if ($clavesActuales) {
+                $marcas = implode(", ", array_fill(0, count($clavesActuales), "?"));
+                $stmt = $pdo->prepare("DELETE FROM `$tabla` WHERE `$columnaClave` NOT IN ($marcas)");
+                $stmt->execute($clavesActuales);
             } else {
                 $pdo->exec("DELETE FROM `$tabla`");
             }
